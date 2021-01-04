@@ -1,8 +1,0 @@
-# Dimensions
-220 220 1 1 1 1 5 1 1 1 1 1 1 1 1 1 
-# Command
-pics -d5 -e -l1 -r 0.005 -i50 -p dcf -t traj -B u kdata csm recon 
-# Files
- >recon <dcf <traj <u <csm <kdata
-# Creator
-BART v0.4.04-65-gd4e6e2e-dirty
