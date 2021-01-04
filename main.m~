@@ -1,0 +1,114 @@
+%% Magnetic Resonance Fingerprinting reconstruction code
+% SUMMARY: Code shows one example of an in-vivo abdominal MRF
+% reconstruction on a 1.5T MR-linac. Reconstruction includes, dictionary
+% generation and mrf reconstruction.
+%
+% Notes:
+%  - Make sure you have write permission in the working directory
+%  - You must have BART version 0.4.04 or higher, otherwhise no support for
+%       pics temporal base.
+%  - The code for the GIRF corrections is not included in the script yet.
+%  - The dictionary generation code is slow, on my own machine I use Julia based code, which I am not able to provide. 
+% 
+% Dependencies: 
+%  - I use some code from Jakob's Asslaender's repository on low-rank ADMM
+%  MRF: https://bitbucket.org/asslaender/nyu_mrf_recon/src/master/
+%  - The BART toolbox from berkeley: https://bitbucket.org/asslaender/nyu_mrf_recon/src/master/
+%  - Extended phase graph code from M. Weigel: http://epg.matthias-weigel.net/
+%
+% If you find this code useful please cite:
+%   Bruijnen, T., van der Heide, O., Intven, M. P. W., Mook, S., Lagendijk, J. J. W., van den Berg, C. A. T., & Tijssen, R. H. N. (2020).
+%   Technical feasibility of Magnetic Resonance Fingerprinting on a 1.5T MRI-Linac.
+%   Phys Med Biol. 2020 Sep 25. doi: 10.1088/1361-6560/abbb9d. Epub ahead of print. PMID: 32977318.
+%
+% Contact: T.Bruijnen@umcutrecht.nl | University Medical Center Utrecht
+% Department of Radiotherapy, University Medical Center Utrecht, Utrecht, the Netherlands
+% Computational Imaging Group for MRI diagnostics and therapy, Centre for
+% Image Sciences, University Medical Center Utrecht, Utrecht, The Netherlands
+%
+% Init: T.Bruijnen - 20200101
+
+% Initialize paths, check for bart toolbox and load data
+% Add path to BART toolbox
+bart_loc = '/local_scratch2/tbruijnen/BART_V2/bart/'; % Make sure this ends with a forward slash
+addpath(genpath(bart_loc))
+addpath(fullfile(bart_loc))
+setenv('TOOLBOX_PATH',bart_loc);
+
+% check if bart toolbox is installed
+if ~isempty(which('bart'));else;disp('>> BART toolbox not found in path. Please check BART path.');end
+
+% Add recon code to path
+addpath(genpath('../mrf-mrl-recon/'))
+
+% Load data
+U = load('U.mat');
+U.RawKspaceData = U.RawKspaceData(:,:,:,:,1); % Three repeated measurements (averages)
+
+% MRF dictionary parameters
+R    = 5;
+T1   = (0.1:0.05:2.0);     % T1 list
+T2   = (0.02:0.005:0.3);      % T2 list
+
+% LR inversion parameters
+lambda = 0.5E-02;
+n_iter = 50;
+
+% Data preprocessing 
+U.RawKspaceData = noise_prewhitening(U.RawKspaceData,U.Coils.Noise_samples);
+kdim            = c12d(size(U.RawKspaceData));
+traj            = U.ReconFrameTags.Encoding.KxOversampling * (radial_trajectory([kdim(1) kdim(2)],U.Sequence.Pulsediagram.Angle1));
+traj            = repmat(traj,[1 1 1 1 kdim(5)]);
+dcf             = permute(radial_density(traj(:,:,:,:,1)),[1 2 3 5 4]);
+N               = ceil(max(abs(traj(:))));
+
+% Model based phase correction - in the paper this was done with the GIRF - that code I
+% could not make available yet. 
+% Moussavi, A., Untenberger, M., Uecker, M., & Frahm, J. (2014). 
+% Correction of gradient-induced phase errors in radial MRI. 
+% Magnetic Resonance in Medicine, 71(1), 308–312. https://doi.org/10.1002/mrm.24643
+U.RawKspaceData = radial_phase_correction_model(U.RawKspaceData,traj);    
+
+% Reconstruct multi-channel images to estimate CSM
+nufft = bart(['nufft -a -d ',num2str(N),':',num2str(N),':1'],0.5 * traj,permute(bsxfun(@times,dcf,U.RawKspaceData),[3 1 2 4])); 
+csm   = bart('ecalib -m1',bart('fft 3',nufft));
+
+% Compute MRF dictionary - without slice profile for speed
+[dict,idx] = mrf_dictionary_computation(U,T1,T2,1,1,1,50,[0 0],[],[]); 
+
+% Compress MRF dictionary with Jakob's MRF code:
+D = MRF_dictionary_umcu(idx', R, double(sum(dict,3))); % epg
+
+% First write all the cfl/hdr files in the correct dimensions for BART
+writecfl('csm',single(csm));
+writecfl('u',permute(D.u,[3 4 5 6 7 1 2]));
+writecfl('traj',permute(.5 * traj,[1 2 5 4 6 3]))
+writecfl('dcf',permute(sqrt(dcf),[5 1 3 4 6 2]));
+writecfl('kdata',permute(U.RawKspaceData,[3 1 5 4 6 2]));
+
+% Reconstruct singular value images with BART
+system([bart_loc ,'bart pics -d5 -e -l1 -r ',num2str(lambda),' -i',num2str(n_iter),' -p ','dcf',' ',...
+	' -t ','traj',' ','-B ','u',' ','kdata',' ','csm',' ','recon']);
+svd_images = reshape(readcfl('recon'),N,N,R);
+match_images = reshape(svd_images,N^2,R);
+
+% Dictionary match on singular value images
+c   = zeros([size(match_images,1) 1],'single');
+idx = zeros([size(match_images,1) 1],'single');
+for n = 1 : N^2
+    [c(n,1),idx(n,1)] = max(match_images(n,:) * conj(D.magnetization), [], 2);
+end
+Qmaps = reshape(D.lookup_table(idx,:),[[N N 1], size(D.lookup_table,2)]);
+Qmaps = cat(numel(size(Qmaps)),Qmaps,reshape(c ./ D.normalization(idx).',[N N]));
+
+% Do some background masking
+mask = sum(abs(reshape(svd_images,[[N N] R])),3);
+mask(mask > .1 * max(mask(:))) = 1;
+mask(mask < .1 * max(mask(:))) = 0;
+Qmaps = bsxfun(@times,Qmaps,mask);
+
+% Visualize parameter maps and singular value images
+figure(1);imshow3(demax(flip(abs(svd_images),1)),[0 0.5],[1 R])
+figure(2);s1=subplot(131);imshow(flip(Qmaps(:,:,1),1),[0 2]);colormap(s1,inferno)
+s2=subplot(132);imshow(flip(Qmaps(:,:,2),1),[0 .15]);colormap(s2,parula)
+s3=subplot(133);imshow(demax(flip(abs(Qmaps(:,:,4)),1)),[0 1]);colormap(s3,gray)
